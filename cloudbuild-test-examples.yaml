@@ -1,0 +1,417 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+steps:
+- id: "clone tutorials-and-examples"
+  name: "gcr.io/cloud-builders/git"
+  args:
+    - clone
+    - https://github.com/ai-on-gke/tutorials-and-examples.git
+    - /workspace/tutorials-and-examples
+
+- id: "adk-ray-mcp: prepare tests"
+  name: "gcr.io/cloud-builders/gcloud"
+  entrypoint: "bash"
+  args:
+    - '-c'
+    - |
+      cp -r /workspace/tutorials-and-examples/ci-resources/adk/ray-mcp/tests /workspace/tutorials-and-examples/adk/ray-mcp/tests
+      cp -r /workspace/tutorials-and-examples/ci-resources/ray-serve/tests /workspace/tutorials-and-examples/ray-serve/tests
+  waitFor: ["clone tutorials-and-examples"]
+
+- id: "adk-ray-mcp: validate platform"
+  name: "gcr.io/${PROJECT_ID}/terraform"
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/terraform"
+  script: |
+    terraform init -no-color
+    terraform validate -no-color
+  waitFor: ["adk-ray-mcp: prepare tests"]
+
+- id: 'adk-ray-mcp: create gke cluster'
+  name: "gcr.io/${PROJECT_ID}/terraform"
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/terraform"
+  env:
+  - "KUBE_LOAD_CONFIG_FILE=false"
+  entrypoint: 'sh'
+  args:
+  - '-c'
+  - |
+    set -e
+
+    echo "fail" > /workspace/adk_ray_mcp_gke_cluster_result.txt
+    terraform apply \
+    -var-file=default_env.tfvars \
+    -var=project_id=$PROJECT_ID \
+    -var=default_resource_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=cluster_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-cluster \
+    -var=cluster_location=$_RAY_SERVE_REGION \
+    -var=autopilot_cluster=$_AUTOPILOT_CLUSTER \
+    -var=network_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=subnetwork_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=subnetwork_region=$_RAY_SERVE_REGION \
+    -var=image_repository_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=iam_service_account_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-sa \
+    -var=k8s_service_account_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-sa \
+    -auto-approve -no-color
+    echo "pass" > /workspace/adk_ray_mcp_gke_cluster_result.txt
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: validate platform']
+
+- id: "adk-ray-mcp: install kuberay-operator"
+  name: 'gcr.io/${PROJECT_ID}/helm'
+  args:
+  - 'install'
+  - 'kuberay-operator'
+  - 'kuberay/kuberay-operator'
+  - '--version'
+  - '1.3.0'
+  env:
+  - "CLOUDSDK_COMPUTE_ZONE=${_RAY_SERVE_REGION}"
+  - "CLOUDSDK_CONTAINER_CLUSTER=ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}-cluster"
+  - "HELM_REPO_NAME=kuberay"
+  - "HELM_REPO_URL=https://ray-project.github.io/kuberay-helm/"
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: create gke cluster']
+
+- id: "adk-ray-mcp: build ray-serve-vllm"
+  name: 'gcr.io/cloud-builders/gcloud'
+  dir: "/workspace/tutorials-and-examples/ray-serve/ray-serve-vllm"
+  args:
+  - builds
+  - submit
+  - --tag
+  - us-docker.pkg.dev/$PROJECT_ID/ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER/llama-ray-serve:latest
+  - .
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: create gke cluster']
+
+- id: "adk-ray-mcp: build mcp-server"
+  name: 'gcr.io/cloud-builders/gcloud'
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/mcp_server"
+  args:
+  - builds
+  - submit
+  - --tag
+  - us-docker.pkg.dev/$PROJECT_ID/ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER/mcp-server:latest
+  - .
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: create gke cluster']
+
+- id: "adk-ray-mcp: build adk-agent"
+  name: 'gcr.io/cloud-builders/gcloud'
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/adk_agent"
+  args:
+  - builds
+  - submit
+  - --tag
+  - us-docker.pkg.dev/$PROJECT_ID/ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER/adk-agent:latest
+  - .
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: create gke cluster']
+
+- id: 'adk-ray-mcp: generate kubeconfig'
+  name: 'gcr.io/cloud-builders/gcloud'
+  args:
+  - 'container'
+  - 'clusters'
+  - 'get-credentials'
+  - 'ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}-cluster'
+  - '--region=${_RAY_SERVE_REGION}'
+  - '--project=${PROJECT_ID}'
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: create gke cluster']
+
+- id: 'ray-serve: allocate L4 GPU'
+  name: "gcr.io/cloud-builders/kubectl"
+  env:
+  - "KUBE_LOAD_CONFIG_FILE=false"
+  entrypoint: 'sh'
+  args:
+  - '-c'
+  - |
+    set -e
+
+    echo "fail" > /workspace/adk_ray_mcp_allocate_l4_gpu_result.txt
+
+    cat <<EOF > /workspace/gpu-l4-allocation.yaml
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: my-gpu-pod
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-l4"
+      containers:
+      - name: my-gpu-container
+        image: nvidia/cuda:11.0.3-runtime-ubuntu20.04
+        command: ["/bin/bash", "-c", "--"]
+        args: ["while true; do sleep 600; done;"]
+        resources:
+          limits:
+            cpu: "8"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "8"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+    EOF
+    cat /workspace/gpu-l4-allocation.yaml
+
+    kubectl apply -f /workspace/gpu-l4-allocation.yaml
+    kubectl wait --for=condition=Ready pod/my-gpu-pod --timeout=1200s
+    echo "The GPU allocation is completed"
+
+    echo "pass" > /workspace/adk_ray_mcp_allocate_l4_gpu_result.txt
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: generate kubeconfig']
+
+- id: "adk-ray-mcp: test kuberay"
+  name: "gcr.io/cloud-builders/kubectl"
+  dir: "/workspace/tutorials-and-examples/ray-serve/ray-serve-vllm"
+  secretEnv: ["HF_TOKEN"]
+  env:
+    - "CLOUDSDK_COMPUTE_ZONE=${_RAY_SERVE_REGION}"
+    - "CLOUDSDK_CONTAINER_CLUSTER=ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}-cluster"
+  entrypoint: 'sh'
+  args:
+  - '-c'
+  - |
+    set -e
+    echo "fail" > /workspace/adk_ray_mcp_deploy_ray-serve.txt
+
+    kubectl rollout status deployment/kuberay-operator
+
+    kubectl create secret generic hf-secret \
+      --from-literal=hf_api_token=$$HF_TOKEN \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    sed -i "s|image: us-docker.pkg.dev/<PROJECT-ID>/llama-ray/llama-ray-serve:latest|image: us-docker.pkg.dev/${PROJECT_ID}/ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}/llama-ray-serve:latest|g" ray-service.yaml
+    sed -i "s|serviceAccount: adk-ray-agent-sa|serviceAccount: ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}-sa|g" ray-service.yaml
+    cat ray-service.yaml
+    kubectl delete -f /workspace/gpu-l4-allocation.yaml
+    kubectl apply -f ray-service.yaml
+
+    sleep 30s
+    kubectl wait --for=jsonpath='.status.conditions[0].status'=True rayservice/llama-31-8b --timeout=2400s
+    kubectl get rayservice llama-31-8b -o yaml
+
+    kubectl port-forward service/llama-31-8b-serve-svc 8000:8000 &
+    sleep 5
+
+    city="New York"
+    if bash ../tests/test_model.sh | grep -q -m 1 "$city"; then
+      echo "SUCCESS: String '$city' found."
+    else
+      echo "ERROR: $city not found."
+      exit 1
+    fi
+
+    echo "pass" > /workspace/adk_ray_mcp_deploy_ray-serve.txt
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: install kuberay-operator', 'adk-ray-mcp: build ray-serve-vllm', 'adk-ray-mcp: build mcp-server', 'adk-ray-mcp: build adk-agent', 'ray-serve: allocate L4 GPU']
+
+- id: "adk-ray-mcp: test adk"
+  name: "gcr.io/cloud-builders/kubectl"
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/mcp_server"
+  env:
+    - "CLOUDSDK_COMPUTE_ZONE=${_RAY_SERVE_REGION}"
+    - "CLOUDSDK_CONTAINER_CLUSTER=ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}-cluster"
+  entrypoint: 'sh'
+  args:
+  - '-c'
+  - |
+    set -e
+    echo "fail" > /workspace/adk_ray_mcp_test_guide.txt
+
+    kubectl create namespace adk-weather-tutorial
+    sed -i "s|image: us-docker.pkg.dev/<PROJECT_ID>/llama-ray/mcp-server:latest|image: us-docker.pkg.dev/${PROJECT_ID}/ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}/mcp-server:latest|g" deployment_weather_mcp.yaml
+    kubectl apply -f deployment_weather_mcp.yaml
+
+    cd /workspace/tutorials-and-examples/adk/ray-mcp/adk_agent
+    sed -i "s|image: us-docker.pkg.dev/<PROJECT_ID>/llama-ray/adk-agent:latest|image: us-docker.pkg.dev/${PROJECT_ID}/ml-adk-ray-mcp-${_BUILD_ID}-${_AUTOPILOT_CLUSTER}/adk-agent:latest|g" deployment_agent.yaml
+    kubectl apply -f deployment_agent.yaml
+    sleep 10s
+    kubectl -n adk-weather-tutorial rollout status deployment/weather-mcp-server
+    kubectl -n adk-weather-tutorial rollout status deployment/adk-agent
+    sleep 10s
+
+    apt update
+    apt install python3-venv python3-pip --assume-yes
+    pip install requests
+
+    kubectl -n adk-weather-tutorial port-forward svc/adk-agent 8001:80 &
+    sleep 5s
+
+    python3 /workspace/tutorials-and-examples/adk/ray-mcp/tests/test.py http://127.0.0.1:8001
+
+    echo "pass" > /workspace/adk_ray_mcp_test_guide.txt
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: build mcp-server', 'adk-ray-mcp: build adk-agent', 'adk-ray-mcp: test kuberay']
+
+- id: 'adk-ray-mcp: cleanup gke cluster'
+  name: "gcr.io/${PROJECT_ID}/terraform"
+  dir: "/workspace/tutorials-and-examples/adk/ray-mcp/terraform"
+  entrypoint: 'sh'
+  args:
+  - '-c'
+  - |
+    set -e
+
+    echo "fail" > /workspace/adk_ray_mcp_cleanup_gke_cluster.txt
+    terraform destroy \
+    -var-file=default_env.tfvars \
+    -var=project_id=$PROJECT_ID \
+    -var=default_resource_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=cluster_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-cluster \
+    -var=cluster_location=$_RAY_SERVE_REGION \
+    -var=autopilot_cluster=$_AUTOPILOT_CLUSTER \
+    -var=network_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=subnetwork_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=subnetwork_region=$_RAY_SERVE_REGION \
+    -var=image_repository_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER \
+    -var=iam_service_account_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-sa \
+    -var=k8s_service_account_name=ml-adk-ray-mcp-$_BUILD_ID-$_AUTOPILOT_CLUSTER-sa \
+    -auto-approve -no-color
+    echo "pass" > /workspace/adk_ray_mcp_cleanup_gke_cluster.txt
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: test adk']
+
+- id: 'adk-ray-mcp: create github issue'
+  name: 'gcr.io/cloud-builders/gcloud'
+  secretEnv: ["GH_CLIENT_ID", "GH_PEM"]
+  entrypoint: 'bash'
+  args:
+  - -c
+  - |
+    apt update
+    apt install jq curl python3-venv python3-pip --assume-yes
+    pip install PyJWT cryptography
+
+    if [[ $_GITHUB_ISSUE != "true" ]]; then
+      exit 0
+    fi
+
+    if [[ "$_GITHUB_ISSUE" == "true" && "$(cat /workspace/adk_ray_mcp_allocate_l4_gpu_result.txt)" != "pass" ]]; then
+      gcloud pubsub topics publish ci-schedule \
+        --message="{\"trigger_name\": \"adk-ray-mcp-scheduled\", \"iteration\": \"$_ITERATION\"}"
+      exit 0
+    fi
+
+    if curl -L \
+      -H "Accept: application/vnd.github+json" \
+      -H "Authorization: Bearer $$GITHUB_TOKEN" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      https://api.github.com/repos/ai-on-gke/tutorials-and-examples/issues | jq -e '.[] | select(.labels[] | .name == "adk-ray-mcp") | select(.labels[] | .name == "ci/automated-issue")' > /dev/null
+    then
+      exit 0
+    fi
+
+    failed_steps=""
+
+    if [[ $(cat /workspace/adk_ray_mcp_gke_cluster_result.txt) != "pass" ]]; then
+      failed_steps+="* adk-ray-mcp gke cluster creation failed\n"
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_deploy_ray-serve.txt) != "pass" ]]; then
+      failed_steps+="* adk-ray-mcp deploy ray-serve failed\n"
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_test_guide.txt) != "pass" ]]; then
+      failed_steps+="* adk-ray-mcp test guide failed\n"
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_cleanup_gke_cluster.txt) != "pass" ]]; then
+      failed_steps+="* adk-ray-mcp gke cluster cleanup failed\n"
+    fi
+
+    if [[ -n "$failed_steps" ]]; then
+      issue_title="ADK Ray-MCP CI/CD Failure: Some steps have failed"
+      issue_body="The following steps failed in the Cloud Build pipeline:\n\n$failed_steps"
+
+      payload=$(printf '{"title":"%s","body":"%s","labels":["bug", "adk-ray-mcp", "ci/automated-issue"]}' "$issue_title" "$issue_body")
+
+      jwt=$(python3 /workspace/tutorials-and-examples/ci-resources/generate_jwt.py)
+      gh_token=$(curl --request POST \
+        --url "https://api.github.com/app/installations/90973651/access_tokens" \
+        --header "Accept: application/vnd.github+json" \
+        --header "Authorization: Bearer $jwt" \
+        --header "X-GitHub-Api-Version: 2022-11-28" | jq -r .token)
+
+      curl -L \
+        -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $gh_token" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        https://api.github.com/repos/ai-on-gke/tutorials-and-examples/issues \
+        -d "$payload"
+    fi
+  allowFailure: true
+  waitFor: ['adk-ray-mcp: cleanup gke cluster']
+
+- id: 'adk-ray-mcp: check result'
+  name: "ubuntu"
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    set -e
+
+    echo "pass" > /workspace/check_result.txt
+
+    if [[ $(cat /workspace/adk_ray_mcp_gke_cluster_result.txt) != "pass" ]]; then
+      echo "adk-ray-mcp gke cluster creation failed"
+      echo "error" > /workspace/check_result.txt
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_deploy_ray-serve.txt) != "pass" ]]; then
+      echo "adk-ray-mcp deploy ray-serve failed"
+      echo "error" > /workspace/check_result.txt
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_test_guide.txt) != "pass" ]]; then
+      echo "adk-ray-mcp test guide failed"
+      echo "error" > /workspace/check_result.txt
+    fi
+
+    if [[ $(cat /workspace/adk_ray_mcp_cleanup_gke_cluster.txt) != "pass" ]]; then
+      echo "adk-ray-mcp gke cluster cleanup failed"
+      echo "error" > /workspace/check_result.txt
+    fi
+
+    if [[ $(cat /workspace/check_result.txt) != "pass" ]]; then
+      cat /workspace/check_result.txt
+      exit 1
+    fi
+  waitFor: ['adk-ray-mcp: create github issue']
+
+substitutions:
+  _RAY_SERVE_REGION: us-central1
+  _USER_NAME: github
+  _AUTOPILOT_CLUSTER: "true"
+  _BUILD_ID: ${BUILD_ID:0:8}
+  _ITERATION: "0"
+logsBucket: gs://ai-on-gke-qss-build-logs
+options:
+  substitutionOption: "ALLOW_LOOSE"
+  machineType: "E2_HIGHCPU_8"
+timeout: 5400s
+availableSecrets:
+  secretManager:
+  - versionName: projects/ai-on-gke-qss/secrets/cloudbuild-hf-token/versions/latest
+    env: "HF_TOKEN"
+  - versionName: projects/ai-on-gke-qss/secrets/tutorials-and-examples-client-id/versions/latest
+    env: "GH_CLIENT_ID"
+  - versionName: projects/ai-on-gke-qss/secrets/tutorials-and-examples-pem/versions/latest
+    env: "GH_PEM"
