@@ -30,10 +30,11 @@ jobs:
       contents: "read"
       id-token: "write"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
          submodules: recursive
          fetch-depth: 0
+         persist-credentials: false
       - name: Build sourcefiles
         run: |
           HOST_UID=$(id -u)
@@ -45,7 +46,7 @@ jobs:
             -u ${HOST_UID}:${HOST_GID} \
             floryn90/hugo:0.145.0-ext-alpine build -e production
       - id: "auth"
-        uses: "google-github-actions/auth@v2"
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           project_id: ${{ secrets.GCP_PROJECT }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
@@ -63,7 +64,7 @@ jobs:
         id: deploy
         env:
           ACTIONS_STEP_DEBUG: true
-        uses: google-github-actions/deploy-appengine@v2
+        uses: google-github-actions/deploy-appengine@a343979004148afb93c94c712b467e8e9f01b06b # v2.1.8
         with:
           deliverables: site/app.yaml
           project_id: ${{ secrets.GCP_PROJECT }}
@@ -87,4 +88,6 @@ jobs:
             echo "No versions to delete; 20 or fewer versions exist."
           fi
       - name: Test
-        run: curl "${{ steps.deploy.outputs.url }}"
+        run: curl "${STEPS_DEPLOY_OUTPUTS_URL}"
+        env:
+          STEPS_DEPLOY_OUTPUTS_URL: ${{ steps.deploy.outputs.url }}
