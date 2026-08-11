@@ -15,7 +15,7 @@
 max_concurrency = 2
 user_agent = "curl/7.83. 1"
 retry_wait_time = 10
-accept = ["200", "429"]
+accept = ["200", "202", "429"]
 exclude_all_private = true
 cache_exclude_status = ["429","500..599","400..499"]
 cache = true
