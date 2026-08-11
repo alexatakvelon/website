@@ -19,7 +19,7 @@ cloudShell:
 
 ## Overview
 
-This guide uses a Kubernetes Job to load [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B) model weights hosted on Hugging Face, into a Cloud Storage Bucket, which is used in a vLLM model deployment.
+This guide uses a Kubernetes Job with GCSfuse to directly transfer [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B) model weights from Hugging Face into a Cloud Storage Bucket, which is used in a vLLM model deployment. By using GCSfuse, files are written directly to Cloud Storage without requiring large memory allocations.
 
 ## Before you begin
 
@@ -64,7 +64,7 @@ export CLUSTER_NAME=hf-gcs-transfer
 >[!NOTE]
 >You might have to rerun the export commands if for some reason you reset your shell and the variables are no longer set. This can happen for example when your Cloud Shell disconnects.
 
-Create a GKE Autopilot cluster by running the following command. If you choose to create a GKE standard cluster, you will need enable [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity), and the [Cloud Storage FUSE CSI Driver](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-storage-fuse-csi-driver-setup#enable) on your cluster.
+Create a GKE Autopilot cluster by running the following command. GCSfuse is automatically enabled on GKE Autopilot clusters. If you choose to create a GKE standard cluster, you will need to enable [Workload Identity Federation for GKE](https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity) and the [Cloud Storage FUSE CSI Driver](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-storage-fuse-csi-driver-setup#enable) on your cluster.
  
 ```bash
 gcloud container clusters create-auto ${CLUSTER_NAME} \
@@ -127,6 +127,9 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
 
 1. Save the following file to a file named producer-job.yaml
 
+    >[!IMPORTANT]
+    >The GCSfuse annotations (`gke-gcsfuse/volumes` and `gke-gcsfuse/ephemeral-storage-limit`) must be placed on the pod template metadata, not the Job metadata. This ensures the GCSfuse sidecar is properly injected into the pod.
+
     ```bash
     apiVersion: batch/v1
     kind: Job
@@ -137,6 +140,12 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
         hf-gcs-transfer-ai-on-gke: "true"
     spec:
       template:
+        metadata:
+          annotations:
+            gke-gcsfuse/volumes: "true"
+            gke-gcsfuse/ephemeral-storage-limit: "20Gi"
+            gke-gcsfuse/cpu-limit: "0"
+            gke-gcsfuse/memory-limit: "0"
         spec:
           serviceAccountName: "${SERVICE_ACCOUNT}"
           # Without this, the job will run on an E2 machine, which results in a slower transfer time.
@@ -149,15 +158,14 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
                     operator: In
                     values:
                     - "c3"
-          initContainers:
+          containers:
           - name: download
             image: ubuntu:22.04
             resources:
-              # Need a big enough machine that can fit the full model in RAM, with some buffer room. If you are deploying a larger model, you MUST increase this value to prevent the Pod from being evicted for using too much memory.
               requests:
-                memory: "${MEMORY_REQUIREMENTS}"
+                memory: "8Gi"
               limits:
-                memory: "${MEMORY_REQUIREMENTS}"
+                memory: "8Gi"
             command: ["bash", "-c"]
             args:
             - |
@@ -234,39 +242,14 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
               value: "/data${BUCKET_PATH}"
             volumeMounts:
               - mountPath: "/data"
-                name: model-tmpfs
-          containers:
-          - name: gcloud-upload
-            image: gcr.io/google.com/cloudsdktool/cloud-sdk:stable
-            resources:
-              # Need a big enough machine that can fit the full model in RAM, with some buffer room. If you are deploying a larger model, you MUST increase this value to prevent the Pod from being evicted for using too much memory.
-              requests:
-                memory: "${MEMORY_REQUIREMENTS}"
-              limits:
-                memory: "${MEMORY_REQUIREMENTS}"
-            command: ["bash", "-c"]
-            args:
-            - |
-              start=$(date +%s)
-              model_dir="${MODEL_DIR}"
-              # If BUCKET_PATH is empty, copy the contents of MODEL_DIR to the root of the bucket.
-              if [ -z "$BUCKET_PATH" ]; then
-                model_dir="${MODEL_DIR}/*"
-              fi
-              gcloud storage cp -r $model_dir "${BUCKET_URI}${BUCKET_PATH}"
-              end=$(date +%s)
-              echo "gcloud storage cp took $((end-start)) seconds"
-            env:
-            - name: MODEL_DIR
-              value: "/data${BUCKET_PATH}"
-            volumeMounts:
-            - name: model-tmpfs  # Mount the same volume as the download container
-              mountPath: /data
+                name: gcs-fuse
           restartPolicy: Never
           volumes:
-            - name: model-tmpfs
-              emptyDir:
-                medium: Memory
+            - name: gcs-fuse
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: "${BUCKET_NAME}"
       parallelism: 1         # Run 1 Pods concurrently
       completions: 1         # Once 1 Pods complete successfully, the Job is done
       backoffLimit: 0        # Max retries on failure
@@ -284,17 +267,15 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
     >[!CAUTION]
     >If you changed `MODEL_ID` to a model other than `meta-llama/Meta-Llama-3-8B`, you must do the following. Failure to do so, will prevent this Job from transfering the model successfully.
     >  1. Signed the model's license consent agreement (if required for the model).
-    >  1. Set `MEMORY_REQUIREMENTS` to an appropriate size for chosen model: To be safe, `MEMORY_REQUIREMENTS` should be at least 10Gi greater than the size of the model (the sum of the model's file sizes).
-    >  1. If you are using a GKE Standard cluster with Node Autoprovisioning disabled, you will need to manually provision a C3 nodepool with 1 node, that has RAM memory >=  `MEMORY_REQUIREMENTS`.
+    >  1. If you are using a GKE Standard cluster with Node Autoprovisioning disabled, you will need to manually provision a C3 nodepool with 1 node.
 
     ```bash
     export MODEL_ID=meta-llama/Meta-Llama-3-8B
-    export MEMORY_REQUIREMENTS=30Gi
     export BUCKET_PATH=/model
-    envsubst '$NAMESPACE $SERVICE_ACCOUNT $HF_USER $BUCKET_URI $MODEL_ID $MEMORY_REQUIREMENTS $BUCKET_PATH' < producer-job.yaml | kubectl apply -f -
+    envsubst '$NAMESPACE $SERVICE_ACCOUNT $HF_USER $BUCKET_NAME $MODEL_ID $BUCKET_PATH' < producer-job.yaml | kubectl apply -f -
     ```
 
-    It might take a few minutes for the c3 node to be auto-provisioned, and for pods to be scheduled, and finish copying data to the GCS bucket. When the Job completes, its status is marked "Complete". After the Job completes, your Cloud Storage bucket should contain the `MODEL_ID`'s model's files (except for the `.gitattributes` and the `original/` folder) within the specified `BUCKET_PATH`. If you didn't change the `MODEL_ID`, you should see the [meta-llama/Meta-Llama-3-8B files](https://huggingface.co/meta-llama/Meta-Llama-3-8B/tree/main) in your Cloud Storage bucket, within the `/model` folder. You can use `BUCKET_PATH=""` to upload the model's files into the GCS bucket's root directory.
+    This approach uses GCSfuse to write directly to your Cloud Storage bucket, eliminating the need for large memory allocations. The Job downloads files and writes them directly to the GCS bucket through the GCSfuse mount. When the Job completes, its status is marked "Complete". After the Job completes, your Cloud Storage bucket should contain the `MODEL_ID`'s model's files (except for the `.gitattributes` and the `original/` folder) within the specified `BUCKET_PATH`. If you didn't change the `MODEL_ID`, you should see the [meta-llama/Meta-Llama-3-8B files](https://huggingface.co/meta-llama/Meta-Llama-3-8B/tree/main) in your Cloud Storage bucket, within the `/model` folder. You can use `BUCKET_PATH=""` to upload the model's files into the GCS bucket's root directory.
 
 1. Monitor the status of the transfer. 
 
@@ -304,12 +285,9 @@ gcloud storage buckets create ${BUCKET_URI} --project=${PROJECT_ID} --uniform-bu
     kubectl get job producer-job --namespace ${NAMESPACE}
     ```
     
-    To see logs for the download / gcloud-upload containers while they are running, run the following commands. Note that you will not be able to run these commands once the Job has the "Complete" status: 
+    To see logs from the download container while it is running, run the following command. Note that you will not be able to run this command once the Job has the "Complete" status: 
     ```bash
     kubectl logs jobs/producer-job -c download --namespace=$NAMESPACE
-    ```
-    ```bash
-    kubectl logs jobs/producer-job -c gcloud-upload
     ```
 
     Once you see that the Job has the "Complete" Status, the transfer is complete.
@@ -343,7 +321,7 @@ Now that the model's weights exist in your Cloud Storage bucket, you can deploy 
     --role "roles/storage.objectViewer"
     ```
 
-1. Deploy the following manifest, to create a model deployment, which which loads the model weights from your Cloud Storage bucket into the GPU using GCSFuse. If you did not change the `MODEL_ID`, this will deploy the [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B) model deployment. If you change
+1. Deploy the following manifest, to create a model deployment, which loads the model weights from your Cloud Storage bucket into the GPU using GCSFuse. If you did not change the `MODEL_ID`, this will deploy the [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B) model deployment.
 
 
     ```bash
